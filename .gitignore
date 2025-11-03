@@ -76,3 +76,7 @@ htmlcov/
 *.bak
 *.swp
 .DS_Store
+.claude/
+.cache/
+POSTGRES_MIGRATION_GUIDE.md
+SQL_FEATURE_IMPLEMENTATION_STATUS.md

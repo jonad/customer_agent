@@ -12,7 +12,10 @@ from models import (
     CustomerInquiryRequest, CustomerInquiryResponse, StreamingChatRequest,
     StreamingMessage, StreamEventType, ChatMessage, ChatHistoryRequest,
     ChatHistoryResponse, SessionCreate, SessionResponse, SessionListResponse,
-    UpdateTitleRequest, MessageFeedbackRequest, DeleteSessionResponse
+    UpdateTitleRequest, MessageFeedbackRequest, DeleteSessionResponse,
+    DocumentUploadRequest, DocumentResponse, DocumentDetailResponse,
+    DocumentListResponse, DocumentSearchRequest, DocumentSearchResponse,
+    UnifiedInquiryRequest, UnifiedInquiryResponse
 )
 import asyncio
 from datetime import datetime, timedelta
@@ -21,8 +24,10 @@ from google.adk.sessions import DatabaseSessionService
 from google.adk.runners import Runner
 from agents.customer_agent import CustomerAgentOrchestrator
 from agents.sql_agent import SqlAgentOrchestrator
+from agents.document_agent import DocumentAgentOrchestrator
 from agents.router import RouterOrchestrator
 from sql_query_service import SqlQueryService
+from embedding_service import embedding_service
 from google.genai import types
 import json
 import re
@@ -90,6 +95,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # Initializing the Orchestrators and Services (PostgreSQL only)
 customer_agent = CustomerAgentOrchestrator()
 sql_agent = SqlAgentOrchestrator()
+document_agent = DocumentAgentOrchestrator()
 router_agent = RouterOrchestrator()
 chat_history = ChatHistoryServicePostgres()
 sql_query_service = SqlQueryService()
@@ -276,6 +282,233 @@ async def stream_sql_query_events(user_question: str, session_id: str, user_id: 
 
     except Exception as e:
         yield await format_sse_message(StreamEventType.ERROR, f"SQL processing failed: {str(e)}", session_id)
+
+
+async def stream_document_search_events(user_query: str, session_id: str, user_id: str):
+    """Stream document search processing events in real-time"""
+    try:
+        # Get database session service from application state
+        session_service: DatabaseSessionService = app.state.session_service
+
+        # Store user message in chat history
+        user_message = ChatMessage(
+            role="user",
+            content=user_query,
+            session_id=session_id,
+            user_id=user_id,
+            timestamp=datetime.now().isoformat()
+        )
+        await chat_history.store_message(user_message)
+        await chat_history.update_session_timestamp(session_id)
+
+        # Send initial status
+        yield await format_sse_message(
+            StreamEventType.STATUS,
+            "Processing document search...",
+            session_id
+        )
+
+        # Get or create ADK session
+        current_session = None
+        try:
+            current_session = await session_service.get_session(
+                app_name=APP_NAME,
+                user_id=user_id,
+                session_id=session_id,
+            )
+        except Exception as e:
+            print(f"Session retrieval failed: {e}")
+
+        if current_session is None:
+            current_session = await session_service.create_session(
+                app_name=APP_NAME,
+                user_id=user_id,
+                session_id=session_id,
+            )
+
+        # Step 1: Query Processing (Analyze + Retrieval Strategy)
+        yield await format_sse_message(StreamEventType.DOC_ANALYZING, "Analyzing search query...", session_id)
+
+        runner = Runner(
+            app_name=APP_NAME,
+            agent=document_agent.query_processing_agent,
+            session_service=session_service,
+        )
+
+        user_message_adk = types.Content(
+            role="user", parts=[types.Part.from_text(text=user_query)]
+        )
+
+        # Run query processing pipeline
+        events = runner.run_async(
+            user_id=user_id,
+            session_id=session_id,
+            new_message=user_message_adk,
+        )
+
+        retrieval_strategy = None
+        async for event in events:
+            if event.is_final_response() and event.content and event.content.parts:
+                final_content = event.content.parts[0].text
+                cleaned_response = re.sub(
+                    r"^```(?:json)?\n|```$", "", final_content.strip(), flags=re.IGNORECASE
+                )
+                try:
+                    retrieval_strategy = json.loads(cleaned_response)
+                except json.JSONDecodeError:
+                    yield await format_sse_message(
+                        StreamEventType.ERROR,
+                        "Failed to parse query analysis result",
+                        session_id
+                    )
+                    return
+
+        if not retrieval_strategy:
+            yield await format_sse_message(
+                StreamEventType.ERROR,
+                "Query analysis failed",
+                session_id
+            )
+            return
+
+        # Step 2: Retrieve documents from database using semantic search
+        yield await format_sse_message(StreamEventType.DOC_RETRIEVING, "Retrieving relevant documents...", session_id)
+
+        # Generate embedding for the query
+        query_embedding = await embedding_service.generate_embedding(
+            text=user_query,
+            task_type="RETRIEVAL_QUERY"
+        )
+
+        # Use semantic search if embeddings are available, otherwise fall back to text search
+        if query_embedding:
+            retrieved_docs = await chat_history.search_documents_semantic(
+                query_embedding=query_embedding,
+                limit=retrieval_strategy.get("max_results", 10),
+                threshold=0.3  # Lower threshold for better recall
+            )
+        else:
+            # Fallback to text search if embeddings are not available
+            search_terms = retrieval_strategy.get("search_terms", [])
+            query_str = " ".join(search_terms) if search_terms else user_query
+            retrieved_docs = await chat_history.search_documents_by_content(
+                query=query_str,
+                limit=retrieval_strategy.get("max_results", 10)
+            )
+
+        if not retrieved_docs:
+            # No documents found - return empty result
+            answer_text = f"I couldn't find any documents matching '{user_query}'. The knowledge base may not contain information on this topic."
+
+            assistant_message = ChatMessage(
+                role="assistant",
+                content=answer_text,
+                session_id=session_id,
+                user_id=user_id,
+                timestamp=datetime.now().isoformat()
+            )
+            await chat_history.store_message(assistant_message)
+
+            response_data = {
+                "original_query": user_query,
+                "retrieved_documents": [],
+                "answer": answer_text,
+                "total_results": 0
+            }
+
+            yield await format_sse_message(
+                StreamEventType.FINAL_RESPONSE,
+                json.dumps(response_data),
+                session_id,
+                {"query_type": "document_search"}
+            )
+            return
+
+        # Step 3: Rank and synthesize answer
+        yield await format_sse_message(StreamEventType.DOC_RANKING, "Ranking documents...", session_id)
+
+        # Prepare context for result processing
+        docs_context = f"""Original Query: {user_query}
+Query Analysis: {json.dumps(retrieval_strategy)}
+
+Retrieved Documents:
+{json.dumps(retrieved_docs, indent=2)}"""
+
+        result_message = types.Content(
+            role="user", parts=[types.Part.from_text(text=docs_context)]
+        )
+
+        # Run result processing pipeline (ranker + synthesizer)
+        yield await format_sse_message(StreamEventType.DOC_SYNTHESIZING, "Synthesizing answer...", session_id)
+
+        result_runner = Runner(
+            app_name=APP_NAME,
+            agent=document_agent.result_processing_agent,
+            session_service=session_service,
+        )
+
+        result_events = result_runner.run_async(
+            user_id=user_id,
+            session_id=session_id,
+            new_message=result_message,
+        )
+
+        final_answer = None
+        async for event in result_events:
+            if event.is_final_response() and event.content and event.content.parts:
+                final_content = event.content.parts[0].text
+                cleaned_response = re.sub(
+                    r"^```(?:json)?\n|```$", "", final_content.strip(), flags=re.IGNORECASE
+                )
+                try:
+                    final_answer = json.loads(cleaned_response)
+                except json.JSONDecodeError:
+                    final_answer = {"answer": final_content, "sources_used": [], "confidence": 0.5}
+
+        # Store assistant response
+        answer_text = final_answer.get("answer", "Document search completed") if final_answer else "Document search completed"
+
+        assistant_message = ChatMessage(
+            role="assistant",
+            content=answer_text,
+            session_id=session_id,
+            user_id=user_id,
+            timestamp=datetime.now().isoformat()
+        )
+        await chat_history.store_message(assistant_message)
+
+        # Format documents for response
+        from models import SearchResultDocument
+        formatted_docs = [
+            SearchResultDocument(
+                document_id=str(doc["document_id"]),
+                title=doc["title"],
+                file_type=doc.get("file_type"),
+                metadata=doc.get("metadata"),
+                snippet=doc.get("snippet", ""),
+                relevance_score=None,  # Will be set by ranker in full implementation
+                created_at=doc["created_at"]
+            ).model_dump()
+            for doc in retrieved_docs[:10]
+        ]
+
+        # Send final response
+        response_data = {
+            "original_query": user_query,
+            "retrieved_documents": formatted_docs,
+            "answer": answer_text,
+            "total_results": len(retrieved_docs)
+        }
+
+        yield await format_sse_message(
+            StreamEventType.FINAL_RESPONSE,
+            json.dumps(response_data),
+            session_id,
+            {"query_type": "document_search"}
+        )
+
+    except Exception as e:
+        yield await format_sse_message(StreamEventType.ERROR, f"Document search failed: {str(e)}", session_id)
 
 
 async def stream_agent_events(customer_inquiry: str, session_id: str, user_id: str):
@@ -492,7 +725,17 @@ async def stream_with_routing(user_message: str, session_id: str, user_id: str):
             # Stream SQL query events
             async for event in stream_sql_query_events(user_message, session_id, user_id):
                 yield event
-        else:
+        elif query_type == "document_search":
+            yield await format_sse_message(
+                StreamEventType.STATUS,
+                "Routing to document search...",
+                session_id,
+                {"route": "document_search"}
+            )
+            # Stream document search events
+            async for event in stream_document_search_events(user_message, session_id, user_id):
+                yield event
+        elif query_type == "customer_service":
             yield await format_sse_message(
                 StreamEventType.STATUS,
                 "Routing to customer service...",
@@ -502,6 +745,50 @@ async def stream_with_routing(user_message: str, session_id: str, user_id: str):
             # Stream customer service events
             async for event in stream_agent_events(user_message, session_id, user_id):
                 yield event
+        else:
+            # Unsupported query type
+            yield await format_sse_message(
+                StreamEventType.STATUS,
+                "Query type not supported",
+                session_id,
+                {"route": "unsupported"}
+            )
+
+            # Store user message
+            user_msg = ChatMessage(
+                role="user",
+                content=user_message,
+                session_id=session_id,
+                user_id=user_id,
+                timestamp=datetime.now().isoformat()
+            )
+            await chat_history.store_message(user_msg)
+
+            # Create error response
+            error_message = "I'm sorry, but I can only handle SQL queries, document search queries, and customer service inquiries. Your query doesn't fit into any of these categories."
+
+            # Store assistant response
+            assistant_msg = ChatMessage(
+                role="assistant",
+                content=error_message,
+                session_id=session_id,
+                user_id=user_id,
+                timestamp=datetime.now().isoformat()
+            )
+            await chat_history.store_message(assistant_msg)
+
+            # Send final error response
+            yield await format_sse_message(
+                StreamEventType.FINAL_RESPONSE,
+                json.dumps({
+                    "error": "unsupported_query_type",
+                    "message": error_message,
+                    "supported_types": ["sql_query", "document_search", "customer_service"],
+                    "received_type": query_type
+                }),
+                session_id,
+                {"query_type": query_type}
+            )
 
     except Exception as e:
         yield await format_sse_message(StreamEventType.ERROR, f"Routing failed: {str(e)}", session_id)
@@ -592,105 +879,408 @@ async def stream_chat(request: Request, request_body: StreamingChatRequest):
     )
 
 
-@router.post("/process-inquiry", response_model=CustomerInquiryResponse)
-async def process_customer_inquiry(request_body: CustomerInquiryRequest):
+@router.post("/process-inquiry", response_model=UnifiedInquiryResponse)
+async def process_inquiry_unified(request_body: UnifiedInquiryRequest):
     """
-    Endpoint to interact with the multi-agent ADK system.
-    request_body: {"customer_inquiry": "My internet is not working after the update, please help!"}
-    """
-    # Extract customer inquiry from request
-    customer_inquiry = request_body.customer_inquiry
+    Unified endpoint with intelligent routing to SQL, document search, or customer service.
+    Supports all features from SSE endpoint but returns immediate response without streaming.
 
-    # Generate unique IDs for this processing session
-    unique_id = str(uuid.uuid4())
-    session_id = unique_id
-    user_id = unique_id
+    Request body:
+    {
+        "message": "Your query here",
+        "user_id": "optional-user-id",
+        "session_id": "optional-session-id"
+    }
+
+    Response includes query_type and type-specific response_data:
+    - SQL: {original_question, generated_sql, query_results, natural_language_answer}
+    - Document Search: {original_query, retrieved_documents, answer, total_results}
+    - Customer Service: {original_inquiry, category, suggested_response}
+    """
+    # Extract message and optional parameters
+    user_message = request_body.message
+    user_id = request_body.user_id or str(uuid.uuid4())
+    session_id = request_body.session_id or str(uuid.uuid4())
 
     try:
-        # Get database session service from application state
+        # Get database session service
         session_service: DatabaseSessionService = app.state.session_service
 
-        # Try to get existing session or create new one
-        current_session = None
+        # Generate unique session IDs for each pipeline
+        router_session_id = f"{session_id}-router"
+        sql_session_id = f"{session_id}-sql"
+        doc_session_id = f"{session_id}-doc"
+        cs_session_id = f"{session_id}-cs"
+
+        # Create or get router session
+        # Note: Using "agents" as app_name because RouterLlmAgent is imported from google.adk.agents
+        router_session = None
         try:
-            current_session = await session_service.get_session(
-                app_name=APP_NAME,
+            router_session = await session_service.get_session(
+                app_name="agents",
                 user_id=user_id,
-                session_id=session_id,
+                session_id=router_session_id,
             )
-        except Exception as e:
-            print(
-                f"Existing Session retrieval failed for session_id='{session_id}' "
-                f"and user_uid='{user_id}': {e}"
+        except Exception:
+            pass
+
+        # If no session found, create new session
+        if router_session is None:
+            router_session = await session_service.create_session(
+                app_name="agents",
+                user_id=user_id,
+                session_id=router_session_id,
             )
 
-        # If no session found, creating new session
-        if current_session is None:
-            current_session = await session_service.create_session(
-                app_name=APP_NAME,
-                user_id=user_id,
-                session_id=session_id,
-            )
-        else:
-            print(f"Existing session '{session_id}'has been found. Resuming session.")
-
-        # Initialize the ADK Runner with our multi-agent pipeline
-        runner = Runner(
-            app_name=APP_NAME,
-            agent=customer_agent.root_agent,
+        # Step 1: Route the query using router agent
+        router_runner = Runner(
+            app_name="agents",
+            agent=router_agent.root_agent,
             session_service=session_service,
         )
 
-        # Format the user query as a structured message using the google genais content types
-        user_message = types.Content(
-            role="user", parts=[types.Part.from_text(text=customer_inquiry)]
+        router_message = types.Content(
+            role="user", parts=[types.Part.from_text(text=user_message)]
         )
 
-        # Run the agent asynchronously
-        events = runner.run_async(
+        router_events = router_runner.run_async(
             user_id=user_id,
-            session_id=session_id,
-            new_message=user_message,
+            session_id=router_session_id,
+            new_message=router_message,
         )
 
-        # Process events to find the final response
-        final_response = None
-        last_event_content = None
-        async for event in events:
-            if event.is_final_response():
-                if event.content and event.content.parts:
-                    last_event_content = event.content.parts[0].text
+        routing_result = None
+        async for event in router_events:
+            if event.is_final_response() and event.content and event.content.parts:
+                routing_result = event.content.parts[0].text
+                break
 
-        if last_event_content:
-            final_response = last_event_content
+        if not routing_result:
+            raise HTTPException(status_code=500, detail="Routing classification failed")
+
+        # Parse routing decision
+        cleaned_routing = re.sub(r"^```(?:json)?\n|```$", "", routing_result.strip(), flags=re.IGNORECASE)
+        routing_data = json.loads(cleaned_routing)
+        query_type = routing_data.get("query_type", "customer_service")
+
+        # Step 2: Route to appropriate pipeline based on classification
+        response_data = {}
+
+        if query_type == "sql_query":
+            # SQL Query Pipeline
+            # Create or get SQL session
+            sql_current_session = None
+            try:
+                sql_current_session = await session_service.get_session(
+                    app_name=APP_NAME,
+                    user_id=user_id,
+                    session_id=sql_session_id,
+                )
+            except Exception:
+                pass
+
+            if sql_current_session is None:
+                sql_current_session = await session_service.create_session(
+                    app_name=APP_NAME,
+                    user_id=user_id,
+                    session_id=sql_session_id,
+                )
+
+            # Step 1: SQL Generation (schema, generation, validation)
+            sql_runner = Runner(
+                app_name=APP_NAME,
+                agent=sql_agent.sql_generation_agent,
+                session_service=session_service,
+            )
+
+            sql_message = types.Content(
+                role="user", parts=[types.Part.from_text(text=user_message)]
+            )
+
+            sql_events = sql_runner.run_async(
+                user_id=user_id,
+                session_id=sql_session_id,
+                new_message=sql_message,
+            )
+
+            validation_result = None
+            async for event in sql_events:
+                if event.is_final_response() and event.content and event.content.parts:
+                    final_content = event.content.parts[0].text
+                    cleaned_response = re.sub(
+                        r"^```(?:json)?\n|```$", "", final_content.strip(), flags=re.IGNORECASE
+                    )
+                    try:
+                        validation_result = json.loads(cleaned_response)
+                    except json.JSONDecodeError:
+                        pass
+                    break
+
+            if not validation_result or not validation_result.get("is_valid"):
+                error_msg = validation_result.get("issues", ["SQL query validation failed"]) if validation_result else ["Unknown error"]
+                response_data = {
+                    "original_question": user_message,
+                    "generated_sql": None,
+                    "query_results": None,
+                    "natural_language_answer": f"SQL validation failed: {', '.join(error_msg)}",
+                    "error": ', '.join(error_msg)
+                }
+            else:
+                # Step 2: Execute SQL query
+                sql_query = validation_result.get("validated_sql", "")
+                success, results, error = await sql_query_service.execute_query(sql_query, user_id)
+
+                if not success:
+                    response_data = {
+                        "original_question": user_message,
+                        "generated_sql": sql_query,
+                        "query_results": None,
+                        "natural_language_answer": f"Query execution failed: {error}",
+                        "error": error
+                    }
+                else:
+                    # Step 3: Format results using ResultFormatterAgent
+                    results_context = f"Original Question: {user_message}\nSQL Query: {sql_query}\nQuery Results: {json.dumps(results)}"
+
+                    formatter_message = types.Content(
+                        role="user", parts=[types.Part.from_text(text=results_context)]
+                    )
+
+                    formatter_runner = Runner(
+                        app_name=APP_NAME,
+                        agent=sql_agent.result_formatter,
+                        session_service=session_service,
+                    )
+
+                    formatter_events = formatter_runner.run_async(
+                        user_id=user_id,
+                        session_id=sql_session_id,
+                        new_message=formatter_message,
+                    )
+
+                    formatted_answer = None
+                    async for event in formatter_events:
+                        if event.is_final_response() and event.content and event.content.parts:
+                            final_content = event.content.parts[0].text
+                            cleaned_response = re.sub(
+                                r"^```(?:json)?\n|```$", "", final_content.strip(), flags=re.IGNORECASE
+                            )
+                            try:
+                                formatted_answer = json.loads(cleaned_response)
+                            except json.JSONDecodeError:
+                                formatted_answer = {"natural_language_answer": final_content}
+                            break
+
+                    answer_text = formatted_answer.get("natural_language_answer", "Query executed successfully") if formatted_answer else "Query executed successfully"
+
+                    response_data = {
+                        "original_question": user_message,
+                        "generated_sql": sql_query,
+                        "query_results": results,
+                        "natural_language_answer": answer_text,
+                        "error": None
+                    }
+
+        elif query_type == "document_search":
+            # Document Search Pipeline
+            # Create or get session (use single session for entire document search pipeline)
+            doc_current_session = None
+            try:
+                doc_current_session = await session_service.get_session(
+                    app_name=APP_NAME,
+                    user_id=user_id,
+                    session_id=doc_session_id,
+                )
+            except Exception:
+                pass
+
+            if doc_current_session is None:
+                doc_current_session = await session_service.create_session(
+                    app_name=APP_NAME,
+                    user_id=user_id,
+                    session_id=doc_session_id,
+                )
+
+            # Step 2a: Query Processing (Analyze + Retrieval Strategy)
+            query_runner = Runner(
+                app_name=APP_NAME,
+                agent=document_agent.query_processing_agent,
+                session_service=session_service,
+            )
+
+            query_message = types.Content(
+                role="user", parts=[types.Part.from_text(text=user_message)]
+            )
+
+            query_events = query_runner.run_async(
+                user_id=user_id,
+                session_id=doc_session_id,
+                new_message=query_message,
+            )
+
+            query_analysis = None
+            async for event in query_events:
+                if event.is_final_response() and event.content and event.content.parts:
+                    query_analysis = event.content.parts[0].text
+                    break
+
+            if not query_analysis:
+                response_data = {"error": "Document query analysis failed"}
+            else:
+                cleaned_analysis = re.sub(r"^```(?:json)?\n|```$", "", query_analysis.strip(), flags=re.IGNORECASE)
+                analysis_data = json.loads(cleaned_analysis)
+
+                # Extract search parameters
+                search_terms = analysis_data.get("keywords", []) + analysis_data.get("expanded_terms", [])
+                query_str = " ".join(search_terms) if search_terms else user_message
+
+                # Step 2b: Retrieve documents from database
+                retrieved_docs = await chat_history.search_documents_by_content(
+                    query=query_str,
+                    limit=10
+                )
+
+                if not retrieved_docs:
+                    # No documents found
+                    response_data = {
+                        "original_query": user_message,
+                        "retrieved_documents": [],
+                        "answer": f"I couldn't find any documents matching '{user_message}'. The knowledge base may not contain information on this topic.",
+                        "total_results": 0
+                    }
+                else:
+                    # Step 2c: Rank and synthesize answer
+                    result_runner = Runner(
+                        app_name=APP_NAME,
+                        agent=document_agent.result_processing_agent,
+                        session_service=session_service,
+                    )
+
+                    # Prepare context for result processing (matching SSE endpoint format)
+                    docs_context = f"""Original Query: {user_message}
+Query Analysis: {json.dumps(analysis_data)}
+
+Retrieved Documents:
+{json.dumps(retrieved_docs, indent=2)}"""
+
+                    result_message = types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=docs_context)]
+                    )
+
+                    result_events = result_runner.run_async(
+                        user_id=user_id,
+                        session_id=doc_session_id,
+                        new_message=result_message,
+                    )
+
+                    final_result = None
+                    async for event in result_events:
+                        if event.is_final_response() and event.content and event.content.parts:
+                            final_result = event.content.parts[0].text
+                            break
+
+                    if final_result:
+                        cleaned_result = re.sub(r"^```(?:json)?\n|```$", "", final_result.strip(), flags=re.IGNORECASE)
+                        try:
+                            answer_data = json.loads(cleaned_result)
+                            answer_text = answer_data.get("answer", "Document search completed")
+                        except json.JSONDecodeError:
+                            answer_text = final_result
+                    else:
+                        answer_text = "No answer could be generated"
+
+                    # Format response to match DocumentSearchResponse structure
+                    from models import SearchResultDocument
+                    formatted_docs = [
+                        SearchResultDocument(
+                            document_id=str(doc["document_id"]),
+                            title=doc["title"],
+                            file_type=doc.get("file_type"),
+                            metadata=doc.get("metadata"),
+                            snippet=doc.get("snippet", doc.get("content", "")[:200]),
+                            relevance_score=None,
+                            created_at=doc["created_at"]
+                        ).model_dump()
+                        for doc in retrieved_docs[:10]
+                    ]
+
+                    response_data = {
+                        "original_query": user_message,
+                        "retrieved_documents": formatted_docs,
+                        "answer": answer_text,
+                        "total_results": len(retrieved_docs)
+                    }
+
+        elif query_type == "customer_service":
+            # Customer Service Pipeline
+            # Create or get CS session
+            cs_session = None
+            try:
+                cs_session = await session_service.get_session(
+                    app_name=APP_NAME,
+                    user_id=user_id,
+                    session_id=cs_session_id,
+                )
+            except Exception:
+                pass
+
+            if cs_session is None:
+                cs_session = await session_service.create_session(
+                    app_name=APP_NAME,
+                    user_id=user_id,
+                    session_id=cs_session_id,
+                )
+
+            cs_runner = Runner(
+                app_name=APP_NAME,
+                agent=customer_agent.root_agent,
+                session_service=session_service,
+            )
+
+            cs_message = types.Content(
+                role="user", parts=[types.Part.from_text(text=user_message)]
+            )
+
+            cs_events = cs_runner.run_async(
+                user_id=user_id,
+                session_id=cs_session_id,
+                new_message=cs_message,
+            )
+
+            cs_result = None
+            async for event in cs_events:
+                if event.is_final_response() and event.content and event.content.parts:
+                    cs_result = event.content.parts[0].text
+                    break
+
+            if cs_result:
+                cleaned_cs = re.sub(r"^```(?:json)?\n|```$", "", cs_result.strip(), flags=re.IGNORECASE)
+                response_data = json.loads(cleaned_cs)
+            else:
+                response_data = {"error": "Customer service processing failed"}
+
         else:
-            print("No final response event found from the Sequential Agent.")
+            # Unsupported query type
+            response_data = {
+                "error": "unsupported_query_type",
+                "message": "I'm sorry, but I can only handle SQL queries, document search queries, and customer service inquiries. Your query doesn't fit into any of these categories.",
+                "supported_types": ["sql_query", "document_search", "customer_service"],
+                "received_type": query_type
+            }
 
-        # Parse the JSON response from agents
-        if final_response is None:
-            raise HTTPException(status_code=500, detail="No response received from agent.")
-
-        # Clean up Markdown code block if it exists
-        # This handles responses like: ```json\n{ ... }\n```
-        cleaned_response = re.sub(
-            r"^```(?:json)?\n|```$", "", final_response.strip(), flags=re.IGNORECASE
+        # Return unified response
+        return UnifiedInquiryResponse(
+            query_type=query_type,
+            original_message=user_message,
+            response_data=response_data,
+            session_id=session_id
         )
 
-        # Loading the cleaned JSON
-        try:
-            response_data = json.loads(cleaned_response)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=500, detail="Agent response is not valid JSON.")
-
-        # Return the structured response using your Pydantic model
-        return CustomerInquiryResponse(
-            original_inquiry=response_data.get("original_inquiry", ""),
-            category=response_data.get("category", ""),
-            suggested_response=response_data.get("suggested_response", ""),
-        )
-
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse agent response: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process agent query: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process inquiry: {e}")
 
 
 @router.get("/sessions", response_model=SessionListResponse)
@@ -767,6 +1357,112 @@ async def update_message_feedback(message_id: str, request_body: MessageFeedback
         "message_id": message_id,
         "feedback": request_body.feedback,
         "updated": True
+    }
+
+
+# ======================================
+# Document Management Endpoints
+# ======================================
+
+@router.post("/documents", response_model=DocumentResponse)
+async def upload_document(request_body: DocumentUploadRequest):
+    """
+    Upload a new document to the knowledge base with semantic embeddings.
+    Automatically generates embeddings for semantic search.
+    """
+    from models import DocumentUploadRequest
+    import uuid
+
+    document_id = str(uuid.uuid4())
+
+    # Generate embedding for the document content
+    embedding = await embedding_service.generate_embedding(
+        text=request_body.content,
+        task_type="RETRIEVAL_DOCUMENT"
+    )
+
+    # Store document in database with embedding
+    result = await chat_history.store_document(
+        document_id=document_id,
+        title=request_body.title,
+        content=request_body.content,
+        file_type=request_body.file_type,
+        metadata=request_body.metadata,
+        embedding=embedding
+    )
+
+    return DocumentResponse(
+        document_id=document_id,
+        title=request_body.title,
+        file_type=request_body.file_type,
+        metadata=request_body.metadata,
+        content_length=len(request_body.content),
+        created_at=result.get("created_at", datetime.now().isoformat())
+    )
+
+
+@router.get("/documents", response_model=DocumentListResponse)
+async def list_documents(limit: int = 50, offset: int = 0):
+    """
+    Get list of all documents in the knowledge base.
+    """
+    result = await chat_history.get_all_documents(limit=limit, offset=offset)
+
+    document_responses = [
+        DocumentResponse(
+            document_id=str(doc["document_id"]),
+            title=doc["title"],
+            file_type=doc.get("file_type"),
+            metadata=doc.get("metadata"),
+            content_length=doc.get("content_length", 0),
+            created_at=doc["created_at"],
+            updated_at=doc.get("updated_at")
+        )
+        for doc in result["documents"]
+    ]
+
+    return DocumentListResponse(
+        documents=document_responses,
+        total_count=result["total_count"],
+        limit=limit,
+        offset=offset
+    )
+
+
+@router.get("/documents/{document_id}", response_model=DocumentDetailResponse)
+async def get_document(document_id: str):
+    """
+    Get a specific document by ID with full content.
+    """
+    document = await chat_history.get_document(document_id)
+
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return DocumentDetailResponse(
+        document_id=str(document["document_id"]),
+        title=document["title"],
+        content=document["content"],
+        file_type=document.get("file_type"),
+        metadata=document.get("metadata"),
+        created_at=document["created_at"],
+        updated_at=document.get("updated_at")
+    )
+
+
+@router.delete("/documents/{document_id}")
+async def delete_document(document_id: str):
+    """
+    Delete a document from the knowledge base.
+    """
+    success = await chat_history.delete_document(document_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "document_id": document_id,
+        "deleted": True
     }
 
 

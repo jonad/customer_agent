@@ -3,6 +3,7 @@ uvicorn[standard]
 pydantic
 google-adk
 google-genai
+google-cloud-aiplatform
 python-dotenv
 slowapi
 python-multipart

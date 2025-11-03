@@ -9,8 +9,9 @@ class RouterOrchestrator:
     """
     Orchestrator for query routing classification
 
-    Uses a single LLM agent to classify queries as either:
+    Uses a single LLM agent to classify queries into three types:
     - sql_query: Questions about data, orders, statistics
+    - document_search: Questions seeking information from documents, tutorials, documentation
     - customer_service: Support, billing, general inquiries
     """
 

@@ -1,5 +1,6 @@
 import os
 import uuid
+import json
 from datetime import datetime
 from typing import List, Optional
 import asyncpg
@@ -136,6 +137,58 @@ class ChatHistoryServicePostgres:
                     ('test-user-123', 'Monitor', 1, 399.99, NOW() - INTERVAL '10 days', 'delivered'),
                     ('test-user-123', 'USB Cable', 3, 9.99, NOW() - INTERVAL '3 days', 'delivered')
                 """)
+
+            # Create documents table for document search feature
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS documents (
+                    id SERIAL PRIMARY KEY,
+                    document_id UUID UNIQUE NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    file_type TEXT,
+                    file_path TEXT,
+                    embedding JSONB,
+                    metadata JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Create indexes for documents table
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_documents_document_id ON documents(document_id)
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_documents_created_at ON documents(created_at)
+            """)
+
+            # GIN index for metadata JSONB queries
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_documents_metadata ON documents USING GIN (metadata)
+            """)
+
+            # Insert sample documents if table is empty
+            count = await conn.fetchval("SELECT COUNT(*) FROM documents")
+            if count == 0:
+                await conn.execute("""
+                    INSERT INTO documents (document_id, title, content, file_type, metadata) VALUES
+                    ($1, $2, $3, $4, $5),
+                    ($6, $7, $8, $9, $10),
+                    ($11, $12, $13, $14, $15)
+                """,
+                    str(uuid.uuid4()), 'Python Programming Guide',
+                    'Python is a high-level, interpreted programming language. It supports multiple programming paradigms including procedural, object-oriented, and functional programming. Python is widely used for web development, data analysis, artificial intelligence, and automation.',
+                    'text', '{"tags": ["programming", "python", "tutorial"], "author": "System"}',
+
+                    str(uuid.uuid4()), 'Machine Learning Basics',
+                    'Machine learning is a subset of artificial intelligence that enables systems to learn and improve from experience. Common algorithms include supervised learning (classification, regression), unsupervised learning (clustering), and reinforcement learning.',
+                    'text', '{"tags": ["machine-learning", "ai", "data-science"], "author": "System"}',
+
+                    str(uuid.uuid4()), 'FastAPI Framework Documentation',
+                    'FastAPI is a modern, fast web framework for building APIs with Python. It features automatic OpenAPI documentation, async support, type hints validation with Pydantic, and high performance comparable to NodeJS and Go frameworks.',
+                    'text', '{"tags": ["fastapi", "web-development", "api"], "author": "System"}'
+                )
 
     async def store_message(self, message: ChatMessage) -> str:
         """Store a chat message and return the message ID"""
@@ -371,6 +424,230 @@ class ChatHistoryServicePostgres:
             """, title, datetime.now(), session_id)
 
             return title
+
+    # Document management methods
+    async def store_document(self, document_id: str, title: str, content: str,
+                            file_type: str = None, file_path: str = None,
+                            embedding: list = None, metadata: dict = None) -> dict:
+        """Store a new document with optional embedding"""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            # Convert embedding list to JSONB
+            embedding_json = json.dumps(embedding) if embedding else None
+            metadata_json = json.dumps(metadata) if metadata else None
+
+            await conn.execute("""
+                INSERT INTO documents (document_id, title, content, file_type, file_path, embedding, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
+            """, uuid.UUID(document_id), title, content, file_type, file_path, embedding_json, metadata_json)
+
+            return {
+                "document_id": document_id,
+                "title": title,
+                "created_at": datetime.now().isoformat()
+            }
+
+    async def get_document(self, document_id: str) -> Optional[dict]:
+        """Get a single document by ID"""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT document_id, title, content, file_type, file_path, embedding, metadata, created_at, updated_at
+                FROM documents
+                WHERE document_id = $1
+            """, uuid.UUID(document_id))
+
+            if row:
+                # Parse JSONB fields from strings to dicts/lists
+                embedding = json.loads(row['embedding']) if row['embedding'] and isinstance(row['embedding'], str) else row['embedding']
+                metadata = json.loads(row['metadata']) if row['metadata'] and isinstance(row['metadata'], str) else row['metadata']
+
+                return {
+                    "document_id": str(row['document_id']),
+                    "title": row['title'],
+                    "content": row['content'],
+                    "file_type": row['file_type'],
+                    "file_path": row['file_path'],
+                    "embedding": embedding,
+                    "metadata": metadata,
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None,
+                    "updated_at": row['updated_at'].isoformat() if row['updated_at'] else None
+                }
+            return None
+
+    async def get_all_documents(self, limit: int = 50, offset: int = 0) -> dict:
+        """Get all documents with pagination"""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT document_id, title, file_type, metadata, created_at, updated_at,
+                       LENGTH(content) as content_length
+                FROM documents
+                ORDER BY created_at DESC
+                LIMIT $1 OFFSET $2
+            """, limit, offset)
+
+            total = await conn.fetchval("SELECT COUNT(*) FROM documents")
+
+            documents = []
+            for row in rows:
+                # Parse JSONB fields from strings to dicts
+                metadata = json.loads(row['metadata']) if row['metadata'] and isinstance(row['metadata'], str) else row['metadata']
+
+                documents.append({
+                    "document_id": str(row['document_id']),
+                    "title": row['title'],
+                    "file_type": row['file_type'],
+                    "metadata": metadata,
+                    "content_length": row['content_length'],
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None,
+                    "updated_at": row['updated_at'].isoformat() if row['updated_at'] else None
+                })
+
+            return {
+                "documents": documents,
+                "total_count": total,
+                "limit": limit,
+                "offset": offset
+            }
+
+    async def search_documents_by_content(self, query: str, limit: int = 10) -> list:
+        """Simple text-based search in document content and title"""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT document_id, title, content, file_type, metadata, created_at
+                FROM documents
+                WHERE title ILIKE $1 OR content ILIKE $1
+                ORDER BY created_at DESC
+                LIMIT $2
+            """, f"%{query}%", limit)
+
+            results = []
+            for row in rows:
+                # Extract snippet around match
+                content = row['content']
+                query_lower = query.lower()
+                idx = content.lower().find(query_lower)
+                if idx >= 0:
+                    start = max(0, idx - 50)
+                    end = min(len(content), idx + len(query) + 50)
+                    snippet = content[start:end].strip()
+                    if start > 0:
+                        snippet = "..." + snippet
+                    if end < len(content):
+                        snippet = snippet + "..."
+                else:
+                    snippet = content[:100] + "..." if len(content) > 100 else content
+
+                results.append({
+                    "document_id": str(row['document_id']),
+                    "title": row['title'],
+                    "file_type": row['file_type'],
+                    "metadata": row['metadata'],
+                    "snippet": snippet,
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None
+                })
+
+            return results
+
+    async def search_documents_semantic(self, query_embedding: list, limit: int = 10, threshold: float = 0.5) -> list:
+        """
+        Semantic search using embedding similarity
+        Uses cosine similarity to find the most relevant documents
+
+        Args:
+            query_embedding: Embedding vector of the search query
+            limit: Maximum number of results to return
+            threshold: Minimum similarity score (0.0 to 1.0)
+
+        Returns:
+            List of documents with relevance scores, sorted by similarity
+        """
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            # Retrieve all documents with embeddings
+            rows = await conn.fetch("""
+                SELECT document_id, title, content, file_type, metadata, embedding, created_at
+                FROM documents
+                WHERE embedding IS NOT NULL
+            """)
+
+            results = []
+            for row in rows:
+                try:
+                    # Parse the embedding from JSONB
+                    doc_embedding = json.loads(row['embedding']) if isinstance(row['embedding'], str) else row['embedding']
+
+                    if not doc_embedding:
+                        continue
+
+                    # Calculate cosine similarity
+                    similarity = self._calculate_cosine_similarity(query_embedding, doc_embedding)
+
+                    if similarity >= threshold:
+                        # Create snippet from first 150 characters
+                        content = row['content']
+                        snippet = content[:150] + "..." if len(content) > 150 else content
+
+                        results.append({
+                            "document_id": str(row['document_id']),
+                            "title": row['title'],
+                            "file_type": row['file_type'],
+                            "metadata": row['metadata'],
+                            "snippet": snippet,
+                            "relevance_score": similarity,
+                            "created_at": row['created_at'].isoformat() if row['created_at'] else None
+                        })
+                except Exception as e:
+                    print(f"Error processing document {row.get('document_id')}: {e}")
+                    continue
+
+            # Sort by relevance score descending
+            results.sort(key=lambda x: x['relevance_score'], reverse=True)
+
+            return results[:limit]
+
+    def _calculate_cosine_similarity(self, vec1: list, vec2: list) -> float:
+        """Calculate cosine similarity between two vectors"""
+        if not vec1 or not vec2 or len(vec1) != len(vec2):
+            return 0.0
+
+        # Calculate dot product
+        dot_product = sum(a * b for a, b in zip(vec1, vec2))
+
+        # Calculate magnitudes
+        magnitude1 = sum(a * a for a in vec1) ** 0.5
+        magnitude2 = sum(b * b for b in vec2) ** 0.5
+
+        if magnitude1 == 0 or magnitude2 == 0:
+            return 0.0
+
+        # Cosine similarity
+        return dot_product / (magnitude1 * magnitude2)
+
+    async def update_document_embedding(self, document_id: str, embedding: list) -> bool:
+        """Update the embedding for a document"""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            embedding_json = json.dumps(embedding)
+            result = await conn.execute("""
+                UPDATE documents
+                SET embedding = $1::jsonb, updated_at = $2
+                WHERE document_id = $3
+            """, embedding_json, datetime.now(), uuid.UUID(document_id))
+
+            return result.split()[-1] != '0' if result else False
+
+    async def delete_document(self, document_id: str) -> bool:
+        """Delete a document"""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute("""
+                DELETE FROM documents WHERE document_id = $1
+            """, uuid.UUID(document_id))
+
+            return result.split()[-1] != '0' if result else False
 
     async def close(self):
         """Close the connection pool"""

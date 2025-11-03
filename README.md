@@ -6,12 +6,13 @@ A production-ready FastAPI-based chat application with PostgreSQL backend, SSE s
 
 - **SSE Streaming**: Real-time Server-Sent Events for chat responses
 - **Text-to-SQL Queries**: Natural language to SQL conversion with intelligent routing
+- **Document Search & Retrieval**: Semantic search over knowledge base with multi-agent processing
 - **PostgreSQL Database**: Robust storage with session and message management
 - **Session Management**: Create, list, update, and delete chat sessions
 - **User Feedback**: Like/dislike toggle for individual messages
 - **Auto-generated Titles**: Session titles auto-generated from first message
 - **Multi-agent Processing**: Google ADK integration for intelligent response categorization
-- **Intelligent Routing**: Automatic classification between SQL queries and customer service
+- **Intelligent Routing**: Automatic 3-way classification between SQL queries, document search, and customer service
 - **Rate Limiting**: Built-in protection against API abuse
 - **No Authentication Required**: Simple anonymous user tracking via user_id
 
@@ -180,10 +181,14 @@ data: {"event_type":"final_response","data":"{\"original_inquiry\":\"...\",\"cat
 - `sql_generating`: Generating SQL query
 - `sql_validating`: Validating SQL query
 - `sql_executing`: Executing SQL query
+- `doc_analyzing`: Analyzing document search query
+- `doc_retrieving`: Retrieving relevant documents
+- `doc_ranking`: Ranking documents by relevance
+- `doc_synthesizing`: Synthesizing answer from documents
 - `processing`: Analyzing inquiry or formatting results
 - `categorizing`: Categorizing customer service inquiry
 - `responding`: Generating customer service response
-- `final_response`: Complete structured response (SQL or customer service)
+- `final_response`: Complete structured response (SQL, document search, or customer service)
 - `error`: Error occurred
 
 **Note**: On first message to a new session, the title will be auto-generated from the first 50 characters.
@@ -297,6 +302,167 @@ Non-SQL queries are automatically routed to customer service:
 → Routed to customer service agent
 → Response: Technical Support category
 ```
+
+### Document Search & Knowledge Base
+
+The application includes a knowledge base for storing and searching documents with semantic search capabilities.
+
+#### Upload Document
+
+```bash
+POST /api/documents
+Content-Type: application/json
+
+{
+  "title": "Python Basics Tutorial",
+  "content": "Python is a high-level programming language...",
+  "file_type": "text",
+  "metadata": {
+    "category": "programming",
+    "language": "python"
+  }
+}
+
+Response:
+{
+  "document_id": "uuid",
+  "title": "Python Basics Tutorial",
+  "file_type": "text",
+  "metadata": {
+    "category": "programming",
+    "language": "python"
+  },
+  "content_length": 245,
+  "created_at": "2025-11-02T12:00:00",
+  "updated_at": "2025-11-02T12:00:00"
+}
+```
+
+#### List Documents
+
+```bash
+GET /api/documents?limit=50&offset=0
+
+Response:
+{
+  "documents": [
+    {
+      "document_id": "uuid",
+      "title": "Python Basics Tutorial",
+      "file_type": "text",
+      "metadata": {
+        "category": "programming"
+      },
+      "content_length": 245,
+      "created_at": "2025-11-02T12:00:00",
+      "updated_at": "2025-11-02T12:00:00"
+    }
+  ],
+  "total_count": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+#### Get Document
+
+```bash
+GET /api/documents/{document_id}
+
+Response:
+{
+  "document_id": "uuid",
+  "title": "Python Basics Tutorial",
+  "content": "Python is a high-level programming language...",
+  "file_type": "text",
+  "metadata": {
+    "category": "programming",
+    "language": "python"
+  },
+  "created_at": "2025-11-02T12:00:00",
+  "updated_at": "2025-11-02T12:00:00"
+}
+```
+
+#### Delete Document
+
+```bash
+DELETE /api/documents/{document_id}
+
+Response:
+{
+  "document_id": "uuid",
+  "deleted": true
+}
+```
+
+#### Document Search via Chat
+
+Documents are automatically searched when queries request information:
+
+```bash
+POST /api/stream-chat
+Content-Type: application/json
+
+{
+  "message": "What is Python?",
+  "user_id": "test-user-123",
+  "session_id": "uuid"
+}
+
+Response: Server-Sent Events stream
+data: {"event_type":"status","data":"Routing to document search...","session_id":"uuid","metadata":{"route":"document_search"}}
+
+data: {"event_type":"doc_analyzing","data":"Analyzing search query...","session_id":"uuid","timestamp":"..."}
+
+data: {"event_type":"doc_retrieving","data":"Retrieving relevant documents...","session_id":"uuid","timestamp":"..."}
+
+data: {"event_type":"doc_ranking","data":"Ranking documents...","session_id":"uuid","timestamp":"..."}
+
+data: {"event_type":"doc_synthesizing","data":"Synthesizing answer...","session_id":"uuid","timestamp":"..."}
+
+data: {"event_type":"final_response","data":"{\"original_query\":\"What is Python?\",\"retrieved_documents\":[{\"document_id\":\"uuid\",\"title\":\"Python Basics Tutorial\",\"snippet\":\"Python is a high-level programming language...\",\"relevance_score\":0.95}],\"answer\":\"Python is a high-level programming language that supports multiple programming paradigms...\",\"total_results\":3}","session_id":"uuid","timestamp":"..."}
+```
+
+**Document Search Event Types:**
+- `doc_analyzing`: Query analysis and keyword extraction
+- `doc_retrieving`: Retrieving relevant documents from knowledge base
+- `doc_ranking`: Ranking documents by relevance
+- `doc_synthesizing`: Generating natural language answer from documents
+
+**Document Search Pipeline:**
+
+The document search feature uses a multi-agent pipeline:
+
+1. **Query Analyzer**: Extracts keywords and determines search intent
+2. **Document Retriever**: Searches documents using text-based or embedding-based search
+3. **Relevance Ranker**: Ranks retrieved documents by relevance score
+4. **Answer Synthesizer**: Generates a natural language answer from top documents
+
+**Search Query Examples:**
+
+```bash
+# Information queries
+"What is FastAPI?"
+"Explain machine learning"
+"How to use Python decorators"
+
+# Tutorial requests
+"Show me Python tutorials"
+"Find documentation about REST APIs"
+
+# Concept explanations
+"What are neural networks?"
+"Explain microservices architecture"
+```
+
+**Search Features:**
+- Text-based content search with keyword matching
+- Metadata filtering for targeted search
+- Relevance scoring and ranking
+- Document snippets with context
+- Natural language answer synthesis
+- Future: Vector embedding-based semantic search
 
 ### Message Feedback
 

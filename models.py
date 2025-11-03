@@ -13,6 +13,21 @@ class CustomerInquiryResponse(BaseModel):
     suggested_response: str
 
 
+class UnifiedInquiryRequest(BaseModel):
+    """Request model for unified process-inquiry endpoint with routing"""
+    message: str
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class UnifiedInquiryResponse(BaseModel):
+    """Unified response for all query types (SQL, document search, customer service)"""
+    query_type: str  # "sql_query", "document_search", or "customer_service"
+    original_message: str
+    response_data: dict  # Contains type-specific response data
+    session_id: Optional[str] = None
+
+
 class StreamingChatRequest(BaseModel):
     message: str
     user_id: str
@@ -33,6 +48,11 @@ class StreamEventType(str, Enum):
     SQL_GENERATING = "sql_generating"
     SQL_VALIDATING = "sql_validating"
     SQL_EXECUTING = "sql_executing"
+    # Document Search Event Types
+    DOC_ANALYZING = "doc_analyzing"
+    DOC_RETRIEVING = "doc_retrieving"
+    DOC_RANKING = "doc_ranking"
+    DOC_SYNTHESIZING = "doc_synthesizing"
 
 
 class StreamingMessage(BaseModel):
@@ -103,3 +123,60 @@ class SqlQueryResponse(BaseModel):
     query_results: Optional[list[dict]] = None
     natural_language_answer: str
     error: Optional[str] = None
+
+
+# Document Search Models
+class DocumentUploadRequest(BaseModel):
+    title: str
+    content: str
+    file_type: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
+class DocumentResponse(BaseModel):
+    document_id: str
+    title: str
+    file_type: Optional[str] = None
+    metadata: Optional[dict] = None
+    content_length: Optional[int] = None
+    created_at: str
+    updated_at: Optional[str] = None
+
+
+class DocumentDetailResponse(BaseModel):
+    document_id: str
+    title: str
+    content: str
+    file_type: Optional[str] = None
+    metadata: Optional[dict] = None
+    created_at: str
+    updated_at: Optional[str] = None
+
+
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentResponse]
+    total_count: int
+    limit: int
+    offset: int
+
+
+class DocumentSearchRequest(BaseModel):
+    query: str
+    limit: Optional[int] = 10
+
+
+class SearchResultDocument(BaseModel):
+    document_id: str
+    title: str
+    file_type: Optional[str] = None
+    metadata: Optional[dict] = None
+    snippet: str
+    relevance_score: Optional[float] = None
+    created_at: str
+
+
+class DocumentSearchResponse(BaseModel):
+    original_query: str
+    retrieved_documents: list[SearchResultDocument]
+    answer: str
+    total_results: int
