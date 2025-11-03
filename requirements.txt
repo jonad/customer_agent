@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+google-adk
+google-genai
+python-dotenv
+slowapi
+python-multipart
+aiofiles
+aiosqlite
+asyncpg
+psycopg2-binary
