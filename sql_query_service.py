@@ -5,6 +5,8 @@ Handles secure SQL query generation, validation, and execution
 import os
 import re
 import asyncpg
+from decimal import Decimal
+from datetime import datetime, date
 from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
 
@@ -135,6 +137,14 @@ class SqlQueryService:
 
         return True, None
 
+    def _convert_to_json_serializable(self, value: Any) -> Any:
+        """Convert database values to JSON-serializable types"""
+        if isinstance(value, Decimal):
+            return float(value)
+        elif isinstance(value, (datetime, date)):
+            return value.isoformat()
+        return value
+
     async def execute_query(self, sql_query: str, user_id: str) -> tuple[bool, List[Dict[str, Any]], Optional[str]]:
         """
         Execute SQL query with user_id filtering
@@ -159,8 +169,11 @@ class SqlQueryService:
                 # Execute query
                 rows = await conn.fetch(modified_query)
 
-                # Convert to list of dicts
-                results = [dict(row) for row in rows]
+                # Convert to list of dicts with JSON-serializable values
+                results = [
+                    {key: self._convert_to_json_serializable(value) for key, value in dict(row).items()}
+                    for row in rows
+                ]
 
                 return True, results, None
 

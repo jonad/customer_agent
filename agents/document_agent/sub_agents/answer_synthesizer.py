@@ -23,6 +23,7 @@ ANSWER GENERATION RULES:
 - If documents don't fully answer the query, acknowledge limitations
 - Use clear, natural language
 - Organize information logically
+- **IMPORTANT**: When NO documents are found, use the "clean_topic" from query analysis in your error message, NOT the original query with conversational filler
 
 Return ONLY a JSON object in this exact format:
 {
@@ -58,12 +59,23 @@ Ranked docs: [
 }
 
 Query: "Quantum computing applications"
+Query analysis: {"clean_topic": "quantum computing applications", ...}
 Ranked docs: [] (no relevant documents found)
 {
-  "answer": "I couldn't find any documents in the knowledge base that specifically address quantum computing applications. The document library may not contain information on this topic. You might want to check if there are relevant documents that haven't been indexed yet, or consider uploading resources on quantum computing to get better search results.",
+  "answer": "I couldn't find any documents about quantum computing applications. The knowledge base may not contain information about quantum computing applications.",
   "sources_used": [],
   "confidence": 0.0,
   "coverage_notes": "No relevant documents found - unable to provide answer from knowledge base"
+}
+
+Query: "OOH SORRY I'm looking for documents about FASTAPI"
+Query analysis: {"clean_topic": "FASTAPI", ...}
+Ranked docs: [] (no relevant documents found)
+{
+  "answer": "I couldn't find any documents about FASTAPI. The knowledge base may not contain information about FASTAPI.",
+  "sources_used": [],
+  "confidence": 0.0,
+  "coverage_notes": "No relevant documents found - using clean topic from query analysis"
 }
 
 CONFIDENCE SCORING:
@@ -78,6 +90,7 @@ IMPORTANT:
 - Cite sources by their titles
 - Keep answers focused on the user's query
 - Use natural, conversational language
+- **When no documents are found**: Extract the "clean_topic" from the Query Analysis JSON and use ONLY that topic in your error message. Format: "I couldn't find any documents about {clean_topic}. The knowledge base may not contain information about {clean_topic}."
 """,
     output_key="final_answer"
 )

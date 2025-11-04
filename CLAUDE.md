@@ -20,7 +20,10 @@ This is a production-ready FastAPI-based streaming chatbot application with real
 - **Reliability System** (`reliability.py`): Message queuing, connection management, and rate limiting with Redis fallback
 - **Router Agent** (`agents/router/llm_agent.py`): Intelligent query classification (SQL, Document Search, Customer Service, Unsupported)
 - **SQL Agent** (`agents/sql/sql_agent.py`): Natural language to SQL query generation and execution with safety validation
-- **Document Agent** (`agents/docs/agent.py`): Semantic document search with Vertex AI embeddings and relevance ranking
+- **Document Agent** (`agents/document_agent/agent.py`): Intelligent document search with query rewriting and semantic search
+  - **QueryAnalyzerAgent** (`agents/document_agent/sub_agents/query_analyzer.py`): Analyzes queries, detects grammatical errors, rewrites queries for clarity
+  - **DocumentRetrieverAgent** (`agents/document_agent/sub_agents/document_retriever.py`): Retrieves documents using Vertex AI embeddings and cosine similarity
+  - **AnswerSynthesizerAgent** (`agents/document_agent/sub_agents/answer_synthesizer.py`): Synthesizes final answers from retrieved documents
 - **Customer Service Agents**:
   - **Agent Orchestrator** (`agents/customer_agent/agent.py`): Manages the sequential agent pipeline
   - **CategorizerAgent** (`agents/customer_agent/sub_agents/categorizer.py`): Categorizes inquiries into "Technical Support", "Billing", or "General Inquiry"
@@ -121,12 +124,21 @@ This is a production-ready FastAPI-based streaming chatbot application with real
 9a. Results formatted and returned with metadata
 10a. Final response with SQL results and insights
 
-**Branch B: Document Search Path**
-6b. DOC_SEARCHING event → "Searching knowledge base..."
-7b. Query embedding generated using Vertex AI text-embedding-004
-8b. **DocumentAgent** performs semantic search with cosine similarity
-9b. Top documents ranked by relevance score (threshold: 0.3)
-10b. Final response with relevant documents and snippets
+**Branch B: Document Search Path (with Query Rewriting)**
+6b. **QueryAnalyzerAgent** analyzes query for grammatical errors and clarity
+7b. **Query Rewriting Feature** ⭐ NEW:
+   - If grammatical errors detected (e.g., "Africa people" → "African people"):
+     - Returns `query_confirmation` with rewritten query
+     - Asks user to confirm: "Did you mean: 'African people'?"
+     - User options: "Yes" (use rewritten), "No" (rephrase), "original" (use as-is)
+     - Conversation history maintained across confirmation flow
+   - If query is well-formed: proceeds to search
+8b. DOC_SEARCHING event → "Searching knowledge base..."
+9b. Query embedding generated using Vertex AI text-embedding-004
+10b. **DocumentRetrieverAgent** performs semantic search with cosine similarity
+11b. Top documents ranked by relevance score (threshold: 0.3)
+12b. **AnswerSynthesizerAgent** generates final answer from retrieved documents
+13b. Final response with relevant documents, snippets, and synthesized answer
 
 **Branch C: Customer Service Path**
 6c. CATEGORIZING event → "Categorizing inquiry..."
@@ -149,6 +161,8 @@ This is a production-ready FastAPI-based streaming chatbot application with real
 **Event Types:**
 - `status`: Processing stage updates
 - `routing`: Query classification in progress
+- `query_confirmation`: Query rewriting confirmation needed (NEW)
+- `clarification_needed`: Ambiguous query requiring clarification
 - `sql_executing`: SQL query generation and execution
 - `doc_searching`: Document semantic search
 - `doc_retrieving`: Retrieving documents from knowledge base
@@ -549,6 +563,23 @@ data: {"event_type":"final_response","data":"{\"original_inquiry\":\"My internet
 - ✅ **Metadata support**: Flexible JSONB storage for categories, tags, etc.
 - ✅ **CRUD operations**: Create, Read, Update, Delete document endpoints
 
+### Query Rewriting & Grammar Correction (⭐ NEW)
+- ✅ **Automatic error detection**: QueryAnalyzerAgent detects grammatical errors in search queries
+- ✅ **Intelligent rewriting**: Generates grammatically correct versions with proper English
+- ✅ **User confirmation flow**: Asks user to confirm before using rewritten query
+  - Example: "Africa people" → Suggests "African people"
+  - Message: "Did you mean: 'African people'?"
+- ✅ **Three user options**:
+  - "Yes" → Use rewritten query for search
+  - "No" → Ask user to rephrase manually
+  - "original" → Use original query as-is
+- ✅ **Conversation history**: Maintains context across multi-turn confirmation flows
+- ✅ **Proper English output**: All error messages and responses use clean_topic from analysis
+- ✅ **Examples**:
+  - "Africa people" → "African people" (adjective correction)
+  - "documents machine learning Python" → "Python machine learning documents" (word order improvement)
+- ✅ **Session management**: Fixed session ID handling to preserve conversation context
+
 ### Real-Time Communication
 - ✅ **SSE**: Request-response streaming (one-way, good for simple requests)
 - ✅ **WebSocket**: Bidirectional persistent connections (two-way, good for chat)
@@ -716,17 +747,23 @@ agents_app/
 ├── .env                             # Environment configuration
 ├── CLAUDE.md                        # This file - comprehensive project documentation
 ├── POSTGRES_MIGRATION_GUIDE.md      # PostgreSQL setup guide
-├── test_semantic_search.py          # Semantic search test suite (NEW)
+├── TEST_RESULTS.md                  # End-to-end test results (NEW)
+├── test_semantic_search.py          # Semantic search test suite
+├── test_e2e_simplified.py           # Complete end-to-end API test suite (NEW)
 ├── test_process_inquiry.sh          # Process inquiry endpoint tests
 ├── test_document_search.sh          # Document management tests
 ├── test_sse_unsupported.py          # Unsupported query tests
 ├── agents/
 │   ├── router/
-│   │   └── llm_agent.py             # Query routing agent (NEW)
+│   │   └── llm_agent.py             # Query routing agent
 │   ├── sql/
-│   │   └── sql_agent.py             # SQL query generation agent (NEW)
-│   ├── docs/
-│   │   └── agent.py                 # Document search agent (NEW)
+│   │   └── sql_agent.py             # SQL query generation agent
+│   ├── document_agent/
+│   │   ├── agent.py                 # Document search orchestrator (NEW)
+│   │   └── sub_agents/
+│   │       ├── query_analyzer.py    # Query analysis & rewriting agent (⭐ NEW)
+│   │       ├── document_retriever.py # Document retrieval agent (NEW)
+│   │       └── answer_synthesizer.py # Answer synthesis agent (NEW)
 │   └── customer_agent/
 │       ├── agent.py                 # Customer service orchestrator
 │       └── sub_agents/
@@ -928,6 +965,68 @@ GOOGLE_CLOUD_LOCATION=us-central1
 - Consider implementing caching for frequently accessed embeddings
 - Optimize PostgreSQL query performance with indexes
 
+## Testing & Validation
+
+### End-to-End API Testing
+
+A comprehensive end-to-end test suite is available to validate all API functionality:
+
+**Test Script**: `test_e2e_simplified.py`
+**Test Results**: `TEST_RESULTS.md`
+
+```bash
+# Run complete end-to-end tests
+source venv/bin/activate
+python3 test_e2e_simplified.py
+```
+
+**Test Coverage** (8 test suites, 100% pass rate):
+1. ✅ **Session Management** - Session creation and user ID handling
+2. ✅ **SQL Query Processing** - Simple and complex SQL queries
+3. ✅ **Document Search** - Document retrieval with proper English responses
+4. ✅ **Query Rewriting Flow** ⭐ - Grammatical error detection and correction
+   - Detects errors: "Africa people" → Suggests "African people"
+   - User confirmation with 3 options (Yes/No/original)
+   - Conversation history maintenance
+   - Proper English in all responses
+5. ✅ **Clarification Flow** - Ambiguous query handling
+6. ✅ **Customer Service** - Technical support routing
+7. ✅ **Unsupported Queries** - Greeting, weather, joke detection
+8. ✅ **Chat History** - History retrieval
+
+**Key Features Validated**:
+- Query rewriting for grammatical errors
+- Multi-turn conversation with confirmation
+- Session ID management (fixed bug: `session-id-router-hash` → `session-id-router`)
+- Conversation context preservation ("Yes" uses rewritten query, not "Yes")
+- All error messages use proper English (clean_topic from query analysis)
+
+### Manual Testing Examples
+
+**Test Query Rewriting:**
+```bash
+curl -X POST "http://localhost:8000/api/process-inquiry" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "I'\''m looking for documents about Africa people",
+    "session_id": "test-session-123"
+  }'
+```
+
+Expected: Returns `query_confirmation` with rewritten query "African people"
+
+**Confirm Rewrite:**
+```bash
+curl -X POST "http://localhost:8000/api/process-inquiry" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "Yes",
+    "session_id": "test-session-123"
+  }'
+```
+
+Expected: Searches for "African people" (not "Yes")
+
 ## Support & Resources
 
 - **FastAPI Docs**: https://fastapi.tiangolo.com
@@ -939,10 +1038,25 @@ GOOGLE_CLOUD_LOCATION=us-central1
 ---
 
 **Last Updated**: 2025-11-03
-**Version**: 2.0.0
+**Version**: 2.1.0 (Query Rewriting Feature + Complete E2E Testing)
 **Status**: Production-Ready with Advanced Semantic Search ✅
 
 ## Version History
+
+### v2.1.0 (2025-11-03) - Query Rewriting & Grammar Correction ⭐
+- ✨ Added **QueryAnalyzerAgent** for intelligent query analysis and grammatical error detection
+- ✨ Implemented automatic query rewriting with user confirmation flow
+- ✨ Added three-way user confirmation: "Yes" (use rewritten), "No" (rephrase), "original" (use as-is)
+- ✨ Created comprehensive document search agent pipeline:
+  - QueryAnalyzerAgent: Analyzes and rewrites queries
+  - DocumentRetrieverAgent: Retrieves documents with semantic search
+  - AnswerSynthesizerAgent: Synthesizes final answers
+- 🔧 Fixed conversation history bug in session ID management
+- 🔧 Enhanced proper English output in all error messages (uses clean_topic)
+- 🔧 Added query_confirmation event type to API
+- 📚 Complete end-to-end test suite (test_e2e_simplified.py) with 8 test suites, 100% pass rate
+- 📚 Comprehensive test results documentation (TEST_RESULTS.md)
+- 🎯 **Key Feature**: "Africa people" → Suggests "African people" with user confirmation
 
 ### v2.0.0 (2025-11-03) - Semantic Search & Intelligent Routing
 - ✨ Added Vertex AI embeddings with text-embedding-004 model

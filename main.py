@@ -142,7 +142,7 @@ async def stream_sql_query_events(user_question: str, session_id: str, user_id: 
         current_session = None
         try:
             current_session = await session_service.get_session(
-                app_name=APP_NAME,
+                app_name="agents",
                 user_id=user_id,
                 session_id=session_id,
             )
@@ -151,7 +151,7 @@ async def stream_sql_query_events(user_question: str, session_id: str, user_id: 
 
         if current_session is None:
             current_session = await session_service.create_session(
-                app_name=APP_NAME,
+                app_name="agents",
                 user_id=user_id,
                 session_id=session_id,
             )
@@ -159,8 +159,9 @@ async def stream_sql_query_events(user_question: str, session_id: str, user_id: 
         # Initialize SQL Generation Runner
         yield await format_sse_message(StreamEventType.SQL_GENERATING, "Generating SQL query...", session_id)
 
+        # Using "agents" app_name to match the inferred app_name from LlmAgent's package location
         runner = Runner(
-            app_name=APP_NAME,
+            app_name="agents",
             agent=sql_agent.sql_generation_agent,
             session_service=session_service,
         )
@@ -185,7 +186,7 @@ async def stream_sql_query_events(user_question: str, session_id: str, user_id: 
                 )
                 try:
                     validation_result = json.loads(cleaned_response)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
                     yield await format_sse_message(
                         StreamEventType.ERROR,
                         "Failed to parse SQL validation result",
@@ -193,17 +194,18 @@ async def stream_sql_query_events(user_question: str, session_id: str, user_id: 
                     )
                     return
 
-        if not validation_result or not validation_result.get("is_valid"):
-            error_msg = validation_result.get("issues", ["SQL query validation failed"]) if validation_result else ["Unknown error"]
+        # SqlGeneratorAgent returns {"sql_query": "...", "explanation": "..."}
+        if not validation_result or not validation_result.get("sql_query"):
+            error_msg = "Failed to generate SQL query"
             yield await format_sse_message(
                 StreamEventType.ERROR,
-                f"SQL validation failed: {', '.join(error_msg)}",
+                f"SQL generation failed: {error_msg}",
                 session_id
             )
             return
 
-        # Extract validated SQL
-        sql_query = validation_result.get("validated_sql", "")
+        # Extract generated SQL
+        sql_query = validation_result.get("sql_query", "")
 
         # Execute SQL query
         yield await format_sse_message(StreamEventType.SQL_EXECUTING, "Executing query...", session_id)
@@ -230,7 +232,7 @@ async def stream_sql_query_events(user_question: str, session_id: str, user_id: 
 
         # Run formatter as standalone agent
         formatter_runner = Runner(
-            app_name=APP_NAME,
+            app_name="agents",
             agent=sql_agent.result_formatter,
             session_service=session_service,
         )
@@ -312,7 +314,7 @@ async def stream_document_search_events(user_query: str, session_id: str, user_i
         current_session = None
         try:
             current_session = await session_service.get_session(
-                app_name=APP_NAME,
+                app_name="agents",
                 user_id=user_id,
                 session_id=session_id,
             )
@@ -321,7 +323,7 @@ async def stream_document_search_events(user_query: str, session_id: str, user_i
 
         if current_session is None:
             current_session = await session_service.create_session(
-                app_name=APP_NAME,
+                app_name="agents",
                 user_id=user_id,
                 session_id=session_id,
             )
@@ -330,7 +332,7 @@ async def stream_document_search_events(user_query: str, session_id: str, user_i
         yield await format_sse_message(StreamEventType.DOC_ANALYZING, "Analyzing search query...", session_id)
 
         runner = Runner(
-            app_name=APP_NAME,
+            app_name="agents",
             agent=document_agent.query_processing_agent,
             session_service=session_service,
         )
@@ -397,8 +399,9 @@ async def stream_document_search_events(user_query: str, session_id: str, user_i
             )
 
         if not retrieved_docs:
-            # No documents found - return empty result
-            answer_text = f"I couldn't find any documents matching '{user_query}'. The knowledge base may not contain information on this topic."
+            # No documents found - return empty result using clean_topic if available
+            clean_topic = retrieval_strategy.get("clean_topic", user_query)
+            answer_text = f"I couldn't find any documents about {clean_topic}. The knowledge base may not contain information about {clean_topic}."
 
             assistant_message = ChatMessage(
                 role="assistant",
@@ -442,7 +445,7 @@ Retrieved Documents:
         yield await format_sse_message(StreamEventType.DOC_SYNTHESIZING, "Synthesizing answer...", session_id)
 
         result_runner = Runner(
-            app_name=APP_NAME,
+            app_name="agents",
             agent=document_agent.result_processing_agent,
             session_service=session_service,
         )
@@ -545,7 +548,7 @@ async def stream_agent_events(customer_inquiry: str, session_id: str, user_id: s
         current_session = None
         try:
             current_session = await session_service.get_session(
-                app_name=APP_NAME,
+                app_name="agents",
                 user_id=user_id,
                 session_id=session_id,
             )
@@ -555,7 +558,7 @@ async def stream_agent_events(customer_inquiry: str, session_id: str, user_id: s
         # If no session found, create new session
         if current_session is None:
             current_session = await session_service.create_session(
-                app_name=APP_NAME,
+                app_name="agents",
                 user_id=user_id,
                 session_id=session_id,
             )
@@ -565,7 +568,7 @@ async def stream_agent_events(customer_inquiry: str, session_id: str, user_id: s
 
         # Initialize the ADK Runner
         runner = Runner(
-            app_name=APP_NAME,
+            app_name="agents",
             agent=customer_agent.root_agent,
             session_service=session_service,
         )
@@ -663,7 +666,8 @@ async def stream_with_routing(user_message: str, session_id: str, user_id: str):
 
         # Create or get router session
         # Note: Using "agents" as app_name because RouterLlmAgent is imported from google.adk.agents
-        router_session_id = f"{session_id}-router-{hash(user_message) % 10000}"
+        # Use consistent session ID to maintain conversation history for better routing decisions
+        router_session_id = f"{session_id}-router"
         router_session = None
         try:
             router_session = await session_service.get_session(
@@ -745,6 +749,49 @@ async def stream_with_routing(user_message: str, session_id: str, user_id: str):
             # Stream customer service events
             async for event in stream_agent_events(user_message, session_id, user_id):
                 yield event
+        elif query_type == "clarification_needed":
+            # Query is ambiguous, ask for clarification
+            clarification_question = routing_decision.get("clarification_question", "Could you please provide more details about your request?")
+
+            yield await format_sse_message(
+                StreamEventType.STATUS,
+                "Requesting clarification...",
+                session_id,
+                {"route": "clarification_needed"}
+            )
+
+            # Store user message
+            user_msg = ChatMessage(
+                role="user",
+                content=user_message,
+                session_id=session_id,
+                user_id=user_id,
+                timestamp=datetime.now()
+            )
+            await chat_history.save_message(user_msg)
+
+            # Store clarification response
+            clarification_response = ChatMessage(
+                role="assistant",
+                content=clarification_question,
+                session_id=session_id,
+                user_id=user_id,
+                timestamp=datetime.now()
+            )
+            await chat_history.save_message(clarification_response)
+
+            # Send final clarification response
+            yield await format_sse_message(
+                StreamEventType.FINAL_RESPONSE,
+                json.dumps({
+                    "query_type": "clarification_needed",
+                    "original_message": user_message,
+                    "clarification_question": clarification_question,
+                    "reasoning": routing_decision.get("reasoning", "Query requires clarification"),
+                    "confidence": routing_decision.get("confidence", "low")
+                }),
+                session_id
+            )
         else:
             # Unsupported query type
             yield await format_sse_message(
@@ -972,7 +1019,7 @@ async def process_inquiry_unified(request_body: UnifiedInquiryRequest):
             sql_current_session = None
             try:
                 sql_current_session = await session_service.get_session(
-                    app_name=APP_NAME,
+                    app_name="agents",
                     user_id=user_id,
                     session_id=sql_session_id,
                 )
@@ -981,14 +1028,14 @@ async def process_inquiry_unified(request_body: UnifiedInquiryRequest):
 
             if sql_current_session is None:
                 sql_current_session = await session_service.create_session(
-                    app_name=APP_NAME,
+                    app_name="agents",
                     user_id=user_id,
                     session_id=sql_session_id,
                 )
 
             # Step 1: SQL Generation (schema, generation, validation)
             sql_runner = Runner(
-                app_name=APP_NAME,
+                app_name="agents",
                 agent=sql_agent.sql_generation_agent,
                 session_service=session_service,
             )
@@ -1016,18 +1063,19 @@ async def process_inquiry_unified(request_body: UnifiedInquiryRequest):
                         pass
                     break
 
-            if not validation_result or not validation_result.get("is_valid"):
-                error_msg = validation_result.get("issues", ["SQL query validation failed"]) if validation_result else ["Unknown error"]
+            # SqlGeneratorAgent returns {"sql_query": "...", "explanation": "..."}
+            if not validation_result or not validation_result.get("sql_query"):
+                error_msg = "Failed to generate SQL query"
                 response_data = {
                     "original_question": user_message,
                     "generated_sql": None,
                     "query_results": None,
-                    "natural_language_answer": f"SQL validation failed: {', '.join(error_msg)}",
-                    "error": ', '.join(error_msg)
+                    "natural_language_answer": f"SQL generation failed: {error_msg}",
+                    "error": error_msg
                 }
             else:
                 # Step 2: Execute SQL query
-                sql_query = validation_result.get("validated_sql", "")
+                sql_query = validation_result.get("sql_query", "")
                 success, results, error = await sql_query_service.execute_query(sql_query, user_id)
 
                 if not success:
@@ -1047,7 +1095,7 @@ async def process_inquiry_unified(request_body: UnifiedInquiryRequest):
                     )
 
                     formatter_runner = Runner(
-                        app_name=APP_NAME,
+                        app_name="agents",
                         agent=sql_agent.result_formatter,
                         session_service=session_service,
                     )
@@ -1087,7 +1135,7 @@ async def process_inquiry_unified(request_body: UnifiedInquiryRequest):
             doc_current_session = None
             try:
                 doc_current_session = await session_service.get_session(
-                    app_name=APP_NAME,
+                    app_name="agents",
                     user_id=user_id,
                     session_id=doc_session_id,
                 )
@@ -1096,14 +1144,55 @@ async def process_inquiry_unified(request_body: UnifiedInquiryRequest):
 
             if doc_current_session is None:
                 doc_current_session = await session_service.create_session(
-                    app_name=APP_NAME,
+                    app_name="agents",
                     user_id=user_id,
                     session_id=doc_session_id,
                 )
 
+            # Check if this is a confirmation response to a previous query rewrite
+            recent_history = await chat_history.get_session_history(session_id, limit=5)
+            pending_rewrite = None
+
+            # Look for the most recent query_confirmation in history
+            for msg in reversed(recent_history):
+                if msg.role == "assistant" and "Did you mean:" in msg.content:
+                    # Extract the rewritten query from the confirmation message
+                    import re as re_module
+                    match = re_module.search(r"Did you mean: '([^']+)'\?", msg.content)
+                    if match:
+                        pending_rewrite = match.group(1)
+                        break
+
+            # Check if user is confirming the rewrite
+            user_response_lower = user_message.lower().strip()
+            if pending_rewrite and user_response_lower in ["yes", "confirm", "yes, search for that", "y"]:
+                # User confirmed - use the rewritten query instead
+                user_message = pending_rewrite
+                print(f"✅ User confirmed rewrite. Using: '{user_message}'")
+            elif pending_rewrite and user_response_lower in ["no", "edit", "no, let me rephrase"]:
+                # User wants to rephrase - ask them to provide a new query
+                return UnifiedInquiryResponse(
+                    query_type="clarification_needed",
+                    original_message=user_message,
+                    response_data={
+                        "clarification_question": "Please rephrase your search query:",
+                        "reasoning": "User requested to rephrase the query",
+                        "confidence": "high",
+                        "original_query": user_message
+                    },
+                    session_id=session_id
+                )
+            elif pending_rewrite and "original" in user_response_lower:
+                # User wants to search with original - extract it from history
+                for msg in reversed(recent_history):
+                    if msg.role == "user" and msg.content not in ["yes", "no", "confirm", "edit", "original"]:
+                        user_message = msg.content
+                        print(f"🔄 User requested original query. Using: '{user_message}'")
+                        break
+
             # Step 2a: Query Processing (Analyze + Retrieval Strategy)
             query_runner = Runner(
-                app_name=APP_NAME,
+                app_name="agents",
                 agent=document_agent.query_processing_agent,
                 session_service=session_service,
             )
@@ -1130,6 +1219,55 @@ async def process_inquiry_unified(request_body: UnifiedInquiryRequest):
                 cleaned_analysis = re.sub(r"^```(?:json)?\n|```$", "", query_analysis.strip(), flags=re.IGNORECASE)
                 analysis_data = json.loads(cleaned_analysis)
 
+                # Check if query needs confirmation due to rewriting
+                if analysis_data.get("needs_confirmation", False):
+                    confirmation_msg = f"I noticed your query might have a grammatical issue. Did you mean: '{analysis_data.get('rewritten_query')}'?"
+
+                    # Ensure session exists in chat history
+                    session_exists = await chat_history.session_exists(session_id)
+                    if not session_exists:
+                        await chat_history.create_session(
+                            session_id=session_id,
+                            user_id=user_id,
+                            title="New Search"
+                        )
+
+                    # Save user message and confirmation to chat history
+                    user_msg = ChatMessage(
+                        role="user",
+                        content=user_message,
+                        session_id=session_id,
+                        user_id=user_id,
+                        timestamp=datetime.now().isoformat()
+                    )
+                    await chat_history.store_message(user_msg)
+
+                    assistant_msg = ChatMessage(
+                        role="assistant",
+                        content=confirmation_msg,
+                        session_id=session_id,
+                        user_id=user_id,
+                        timestamp=datetime.now().isoformat()
+                    )
+                    await chat_history.store_message(assistant_msg)
+
+                    return UnifiedInquiryResponse(
+                        query_type="query_confirmation",
+                        original_message=user_message,
+                        response_data={
+                            "original_query": analysis_data.get("original_query", user_message),
+                            "rewritten_query": analysis_data.get("rewritten_query"),
+                            "rewrite_reason": analysis_data.get("rewrite_reason"),
+                            "confirmation_message": confirmation_msg,
+                            "suggested_actions": [
+                                {"action": "confirm", "label": "Yes, search for that"},
+                                {"action": "edit", "label": "No, let me rephrase"},
+                                {"action": "original", "label": "No, search as-is"}
+                            ]
+                        },
+                        session_id=session_id
+                    )
+
                 # Extract search parameters
                 search_terms = analysis_data.get("keywords", []) + analysis_data.get("expanded_terms", [])
                 query_str = " ".join(search_terms) if search_terms else user_message
@@ -1141,17 +1279,18 @@ async def process_inquiry_unified(request_body: UnifiedInquiryRequest):
                 )
 
                 if not retrieved_docs:
-                    # No documents found
+                    # No documents found - use clean_topic from analysis
+                    clean_topic = analysis_data.get("clean_topic", user_message)
                     response_data = {
                         "original_query": user_message,
                         "retrieved_documents": [],
-                        "answer": f"I couldn't find any documents matching '{user_message}'. The knowledge base may not contain information on this topic.",
+                        "answer": f"I couldn't find any documents about {clean_topic}. The knowledge base may not contain information about {clean_topic}.",
                         "total_results": 0
                     }
                 else:
                     # Step 2c: Rank and synthesize answer
                     result_runner = Runner(
-                        app_name=APP_NAME,
+                        app_name="agents",
                         agent=document_agent.result_processing_agent,
                         session_service=session_service,
                     )
@@ -1218,7 +1357,7 @@ Retrieved Documents:
             cs_session = None
             try:
                 cs_session = await session_service.get_session(
-                    app_name=APP_NAME,
+                    app_name="agents",
                     user_id=user_id,
                     session_id=cs_session_id,
                 )
@@ -1227,13 +1366,13 @@ Retrieved Documents:
 
             if cs_session is None:
                 cs_session = await session_service.create_session(
-                    app_name=APP_NAME,
+                    app_name="agents",
                     user_id=user_id,
                     session_id=cs_session_id,
                 )
 
             cs_runner = Runner(
-                app_name=APP_NAME,
+                app_name="agents",
                 agent=customer_agent.root_agent,
                 session_service=session_service,
             )
@@ -1259,6 +1398,17 @@ Retrieved Documents:
                 response_data = json.loads(cleaned_cs)
             else:
                 response_data = {"error": "Customer service processing failed"}
+
+        elif query_type == "clarification_needed":
+            # Query is ambiguous, ask for clarification
+            clarification_question = routing_data.get("clarification_question", "Could you please provide more details about your request?")
+
+            response_data = {
+                "clarification_question": clarification_question,
+                "reasoning": routing_data.get("reasoning", "Query requires clarification"),
+                "confidence": routing_data.get("confidence", "low"),
+                "original_query": user_message
+            }
 
         else:
             # Unsupported query type

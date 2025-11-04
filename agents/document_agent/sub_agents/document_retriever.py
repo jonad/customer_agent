@@ -27,37 +27,41 @@ Return ONLY a JSON object in this exact format:
   "search_terms": ["term1", "term2", "term3"],
   "max_results": 10,
   "relevance_threshold": 0.5,
+  "clean_topic": "extracted from query_analysis",
   "reasoning": "brief explanation of retrieval strategy"
 }
 
 EXAMPLES:
 Query: "Python machine learning tutorials"
-Analysis: {keywords: ["Python", "machine learning", "tutorials"], expanded_terms: ["scikit-learn", "tensorflow"]}
+Analysis: {clean_topic: "Python machine learning tutorials", keywords: ["Python", "machine learning", "tutorials"], expanded_terms: ["scikit-learn", "tensorflow"]}
 {
   "retrieval_method": "text_search",
   "search_terms": ["Python", "machine learning", "tutorials", "scikit-learn", "tensorflow"],
   "max_results": 10,
   "relevance_threshold": 0.5,
+  "clean_topic": "Python machine learning tutorials",
   "reasoning": "Using text search with expanded ML terms for comprehensive results"
 }
 
 Query: "What is FastAPI?"
-Analysis: {keywords: ["FastAPI", "web framework"], expanded_terms: ["Pydantic", "async"]}
+Analysis: {clean_topic: "FastAPI", keywords: ["FastAPI", "web framework"], expanded_terms: ["Pydantic", "async"]}
 {
   "retrieval_method": "text_search",
   "search_terms": ["FastAPI", "Pydantic", "async", "web framework"],
   "max_results": 10,
   "relevance_threshold": 0.6,
+  "clean_topic": "FastAPI",
   "reasoning": "Direct keyword search for specific framework documentation"
 }
 
 Query: "Advanced neural network architectures"
-Analysis: {keywords: ["neural network", "architectures", "advanced"], expanded_terms: ["CNN", "RNN", "transformers"]}
+Analysis: {clean_topic: "neural network architectures", keywords: ["neural network", "architectures", "advanced"], expanded_terms: ["CNN", "RNN", "transformers"]}
 {
   "retrieval_method": "text_search",
   "search_terms": ["neural network", "architectures", "CNN", "RNN", "transformers", "deep learning"],
   "max_results": 15,
   "relevance_threshold": 0.5,
+  "clean_topic": "neural network architectures",
   "reasoning": "Broad search with architecture-specific terms to capture various neural network types"
 }
 

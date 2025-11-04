@@ -13,7 +13,7 @@ You are a data presentation specialist. Your job is to take raw SQL query result
 
 You will receive:
 1. The original user question
-2. The SQL query that was executed from {validation_result}
+2. The SQL query that was executed from {generated_sql}
 3. The query results (will be provided as context)
 
 INSTRUCTIONS:

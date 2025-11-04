@@ -13,7 +13,6 @@ You are an expert SQL query generator. Your job is to convert natural language q
 
 You will receive:
 1. The user's question
-2. The database schema from {table_selection}
 
 DATABASE SCHEMA:
 Table: orders
