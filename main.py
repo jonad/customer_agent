@@ -178,21 +178,33 @@ async def stream_sql_query_events(user_question: str, session_id: str, user_id: 
         )
 
         validation_result = None
+        last_error = None
         async for event in events:
             if event.is_final_response() and event.content and event.content.parts:
                 final_content = event.content.parts[0].text
+                # Clean markdown code fences
                 cleaned_response = re.sub(
-                    r"^```(?:json)?\n|```$", "", final_content.strip(), flags=re.IGNORECASE
+                    r"^```(?:json)?\s*|\s*```$", "", final_content.strip(), flags=re.IGNORECASE | re.MULTILINE
                 )
                 try:
+                    # Keep updating validation_result with each final response
+                    # SequentialAgent returns multiple final responses (one per sub-agent)
+                    # We want the LAST one (from SqlValidatorAgent)
                     validation_result = json.loads(cleaned_response)
+                    last_error = None  # Clear error if parsing succeeds
                 except json.JSONDecodeError as e:
-                    yield await format_sse_message(
-                        StreamEventType.ERROR,
-                        "Failed to parse SQL validation result",
-                        session_id
-                    )
-                    return
+                    last_error = str(e)
+                    # Continue to next event instead of returning
+                    continue
+
+        # If we failed to parse any response, return error
+        if last_error and not validation_result:
+            yield await format_sse_message(
+                StreamEventType.ERROR,
+                f"Failed to parse SQL validation result: {last_error}",
+                session_id
+            )
+            return
 
         # SqlGeneratorAgent returns {"sql_query": "...", "explanation": "..."}
         if not validation_result or not validation_result.get("sql_query"):
@@ -1054,14 +1066,18 @@ async def process_inquiry_unified(request_body: UnifiedInquiryRequest):
             async for event in sql_events:
                 if event.is_final_response() and event.content and event.content.parts:
                     final_content = event.content.parts[0].text
+                    # Clean markdown code fences
                     cleaned_response = re.sub(
-                        r"^```(?:json)?\n|```$", "", final_content.strip(), flags=re.IGNORECASE
+                        r"^```(?:json)?\s*|\s*```$", "", final_content.strip(), flags=re.IGNORECASE | re.MULTILINE
                     )
                     try:
+                        # Keep updating validation_result with each final response
+                        # SequentialAgent returns multiple final responses (one per sub-agent)
+                        # We want the LAST one (from SqlValidatorAgent)
                         validation_result = json.loads(cleaned_response)
                     except json.JSONDecodeError:
                         pass
-                    break
+                    # Don't break - continue to collect all responses
 
             # SqlGeneratorAgent returns {"sql_query": "...", "explanation": "..."}
             if not validation_result or not validation_result.get("sql_query"):
@@ -1636,3 +1652,39 @@ async def read_root():
             "message_feedback": "/api/messages/{message_id}/feedback"
         }
     }
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    import argparse
+    
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Run the Customer Inquiry Processor API")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8000, help="Port to bind to (default: 8000)")
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
+    parser.add_argument("--workers", type=int, default=1, help="Number of worker processes (default: 1)")
+    parser.add_argument("--log-level", default="info", choices=["critical", "error", "warning", "info", "debug"], 
+                        help="Log level (default: info)")
+    
+    args = parser.parse_args()
+    
+    # Run the application
+    print(f"Starting FastAPI application on {args.host}:{args.port}")
+    print(f"API Documentation: http://{args.host if args.host != '0.0.0.0' else 'localhost'}:{args.port}/docs")
+    print(f"Reload mode: {'enabled' if args.reload else 'disabled'}")
+    print(f"Workers: {args.workers}")
+    print(f"Log level: {args.log_level}")
+    print("-" * 80)
+    
+    uvicorn.run(
+        "main:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+        workers=args.workers if not args.reload else 1,  # Workers must be 1 when reload is enabled
+        log_level=args.log_level
+    )

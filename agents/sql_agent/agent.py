@@ -28,9 +28,16 @@ class SqlAgentOrchestrator:
 
     def __init__(self):
         # SQL generation pipeline (runs before execution)
-        # NOTE: Using only SqlGeneratorAgent because SequentialAgent stops after first LlmAgent's final_response
-        # SqlValidator logic is built into SqlGenerator's instructions instead
-        self.sql_generation_agent = SqlGeneratorAgent
+        # Using SequentialAgent to chain schema retrieval, generation, and validation
+        self.sql_generation_agent = SequentialAgent(
+            name="SqlGenerationPipeline",
+            sub_agents=[
+                SchemaRetrieverAgent,
+                SqlGeneratorAgent,
+                SqlValidatorAgent
+            ],
+            description="A pipeline that analyzes user questions, generates SQL queries, and validates them for security"
+        )
 
         # Result formatting (runs after execution)
         self.result_formatter = ResultFormatterAgent

@@ -23,35 +23,42 @@ VALIDATION CHECKLIST:
 
 Return ONLY a JSON object in this exact format:
 {
+  "sql_query": "the SQL query if valid, or corrected version (empty if invalid)",
+  "explanation": "explanation from the generator plus any validation notes",
   "is_valid": true or false,
-  "validated_sql": "the SQL query if valid, or corrected version",
   "issues": ["list of any security or correctness issues found"],
   "recommendation": "pass_through or needs_correction"
 }
 
+IMPORTANT: The "sql_query" field must match the expected output format for downstream processing.
+If the query is invalid and cannot be corrected, set "sql_query" to empty string.
+
 EXAMPLES:
-Input SQL: "SELECT COUNT(*) FROM orders WHERE user_id = '$user_id' AND order_date >= NOW() - INTERVAL '7 days'"
+Input from {generated_sql}: {"sql_query": "SELECT COUNT(*) FROM orders WHERE user_id = '$user_id' AND order_date >= NOW() - INTERVAL '7 days'", "explanation": "Counts orders from last 7 days"}
 {
+  "sql_query": "SELECT COUNT(*) FROM orders WHERE user_id = '$user_id' AND order_date >= NOW() - INTERVAL '7 days'",
+  "explanation": "Counts orders from last 7 days. Validation: Passed all security checks.",
   "is_valid": true,
-  "validated_sql": "SELECT COUNT(*) FROM orders WHERE user_id = '$user_id' AND order_date >= NOW() - INTERVAL '7 days'",
   "issues": [],
   "recommendation": "pass_through"
 }
 
-Input SQL: "DELETE FROM orders WHERE user_id = '$user_id'"
+Input from {generated_sql}: {"sql_query": "DELETE FROM orders WHERE user_id = '$user_id'", "explanation": "Deletes user orders"}
 {
+  "sql_query": "",
+  "explanation": "Query rejected: Uses DELETE statement which is not allowed. Only SELECT queries are permitted.",
   "is_valid": false,
-  "validated_sql": "",
   "issues": ["Uses DELETE statement which is not allowed", "Only SELECT queries are permitted"],
   "recommendation": "needs_correction"
 }
 
-Input SQL: "SELECT * FROM orders"
+Input from {generated_sql}: {"sql_query": "SELECT * FROM orders", "explanation": "Gets all orders"}
 {
-  "is_valid": false,
-  "validated_sql": "SELECT * FROM orders WHERE user_id = '$user_id'",
-  "issues": ["Missing user_id filter - security risk"],
-  "recommendation": "needs_correction"
+  "sql_query": "SELECT * FROM orders WHERE user_id = '$user_id'",
+  "explanation": "Gets all orders. Validation: Added required user_id filter for security.",
+  "is_valid": true,
+  "issues": ["Fixed: Added missing user_id filter"],
+  "recommendation": "pass_through"
 }
 """,
     output_key="validation_result"

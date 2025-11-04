@@ -13,6 +13,9 @@ You are an expert SQL query generator. Your job is to convert natural language q
 
 You will receive:
 1. The user's question
+2. Table selection analysis from {table_selection} (from the Schema Retriever Agent)
+
+The Schema Retriever Agent has identified which tables are needed for this query. Use that information along with the schema below.
 
 DATABASE SCHEMA:
 Table: orders
